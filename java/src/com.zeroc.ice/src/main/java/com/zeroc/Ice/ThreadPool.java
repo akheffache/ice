@@ -14,6 +14,10 @@ import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
 
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 final class ThreadPool implements Executor {
     final class ShutdownWorkItem implements ThreadPoolWorkItem {
         @Override
@@ -66,6 +70,44 @@ final class ThreadPool implements Executor {
         }
     }
 
+    // Handler work item for queuing ready handlers
+    static final class HandlerWorkItem implements ThreadPoolWorkItem {
+        public HandlerWorkItem(EventHandler handler, int operation) {
+            _handler = handler;
+            _operation = operation;
+        }
+
+        @Override
+        public void execute(ThreadPoolCurrent current) {
+            current.operation = _operation;
+            current._handler = _handler;
+	    current._ioCompleted = false;
+
+            current._thread.setState(ThreadState.ThreadStateInUseForIO);
+ 
+            // Check if handler is still valid and interested in this operation
+            if ((_handler._registered & _operation) == 0 || (_handler._disabled & _operation) != 0) {
+                current.ioCompleted();
+                return;
+            }
+            
+            try {
+                _handler.message(current);
+            } catch (Exception ex) {
+                String s = "exception in `" + current._threadPool._prefix + "':\n" + Ex.toString(ex);
+                s += "\nevent handler: " + _handler.toString();
+                current._threadPool._instance.initializationData().logger.error(s);
+            }
+            
+            if (!current._ioCompleted) {
+                current.ioCompleted();
+            }
+        }
+
+        private final EventHandler _handler;
+        private final int _operation;
+    }
+
     //
     // Exception raised by the thread pool work queue when the thread pool is destroyed.
     //
@@ -83,11 +125,13 @@ final class ThreadPool implements Executor {
         _selector = new Selector(instance);
         _threadIndex = 0;
         _inUse = 0;
-        _inUseIO = 0;
-        _promote = true;
         _serialize = properties.getPropertyAsInt(_prefix + ".Serialize") > 0;
         _serverIdleTime = timeout;
         _threadPrefix = Util.createThreadName(properties, _prefix);
+
+        // Initialize selector thread control
+        _selectorRunning = new AtomicBoolean(false);
+        _workQueue = new LinkedBlockingQueue<>();
 
         int nProcessors = Runtime.getRuntime().availableProcessors();
 
@@ -172,8 +216,10 @@ final class ThreadPool implements Executor {
         _hasPriority = hasPriority;
         _priority = priority;
 
-        _workQueue = new ThreadPoolWorkQueue(_instance, this, _selector);
-        _nextHandler = _handlers.iterator();
+        // Start selector thread for work queue pattern
+        _selectorRunning.set(true);
+        _selectorThread = new SelectorThread();
+        _selectorThread.start();
 
         if (_instance.traceLevels().threadPool >= 1) {
             String s =
@@ -229,7 +275,13 @@ final class ThreadPool implements Executor {
         }
 
         _destroyed = true;
-        _workQueue.destroy();
+        
+        // Stop selector thread
+        _selectorRunning.set(false);
+	// Wake up selector thread to notice shutdown
+        _selector.wakeup(); 
+        
+        //_workQueue.destroy();
     }
 
     public synchronized void updateObservers() {
@@ -245,12 +297,10 @@ final class ThreadPool implements Executor {
         handler.setReadyCallback(
             new ReadyCallback() {
                 public void ready(int op, boolean value) {
-                    synchronized (ThreadPool.this) {
-                        if (_destroyed) {
-                            return;
-                        }
-                        _selector.ready(handler, op, value);
+                    if (_destroyed) {
+                        return;
                     }
+                    _selector.ready(handler, op, value);
                 }
             });
     }
@@ -281,7 +331,7 @@ final class ThreadPool implements Executor {
     public synchronized boolean finish(EventHandler handler, boolean closeNow) {
         assert (!_destroyed);
         closeNow = _selector.finish(handler, closeNow);
-        _workQueue.queue(new FinishedWorkItem(handler, !closeNow));
+        _workQueue.offer(new FinishedWorkItem(handler, !closeNow));
         return closeNow;
     }
 
@@ -310,14 +360,19 @@ final class ThreadPool implements Executor {
         }
     }
 
-    public synchronized void dispatch(RunnableThreadPoolWorkItem workItem) {
+    public void dispatch(RunnableThreadPoolWorkItem workItem) {
         if (_destroyed) {
             throw new CommunicatorDestroyedException();
         }
-        _workQueue.queue(workItem);
+        _workQueue.offer(workItem);
     }
 
     public void joinWithAllThreads() throws InterruptedException {
+        // Join selector thread first
+        if (_selectorThread != null) {
+            _selectorThread.join();
+        }
+
         //
         // _threads is immutable after destroy() has been called,
         // therefore no synchronization is needed. (Synchronization wouldn't be possible here
@@ -347,267 +402,109 @@ final class ThreadPool implements Executor {
             });
     }
 
-    private void run(EventHandlerThread thread) {
-        ThreadPoolCurrent current = new ThreadPoolCurrent(_instance, this, thread);
-        boolean select = false;
-        while (true) {
-            if (current._handler != null) {
+    // Dedicated selector thread for work queue pattern
+    private final class SelectorThread extends Thread {
+        public SelectorThread() {
+            super(_threadPrefix + "-selector");
+        }
+
+        @Override
+        public void run() {
+            java.util.List<EventHandlerOpPair> handlers = new java.util.ArrayList<>();
+            
+            while (_selectorRunning.get()) {
                 try {
-                    current._handler.message(current);
-                } catch (DestroyedException ex) {
-                    synchronized (this) {
-                        --_inUse;
-                        thread.setState(ThreadState.ThreadStateIdle);
-                    }
-                    return;
-                } catch (Exception ex) {
-                    String s = "exception in `" + _prefix + "':\n" + Ex.toString(ex);
-                    s += "\nevent handler: " + current._handler.toString();
-                    _instance.initializationData().logger.error(s);
-                }
-            } else if (select) {
-                try {
+                    handlers.clear();
+                    _selector.startSelect();
                     _selector.select(_serverIdleTime);
+                    _selector.finishSelect(handlers);
+                    
+                    // Queue all ready handlers as work items
+                    for (EventHandlerOpPair handlerPair : handlers) {
+                        if (handlerPair.handler != null) {
+                            queueHandler(handlerPair.handler, handlerPair.op);
+                        }
+                    }
                 } catch (Selector.TimeoutException ex) {
-                    synchronized (this) {
+                    synchronized (ThreadPool.this) {
                         if (!_destroyed && _inUse == 0) {
-                            _workQueue.queue(new ShutdownWorkItem()); // Select timed-out.
+                            _workQueue.offer(new ShutdownWorkItem());
                         }
-                        continue;
                     }
-                }
-            }
-
-            synchronized (this) {
-                if (current._handler == null) {
-                    if (select) {
-                        _selector.finishSelect(_handlers);
-                        select = false;
-                        _nextHandler = _handlers.iterator();
-                    } else if (!current._leader && followerWait(current)) {
-                        return; // Wait timed-out.
-                    }
-                } else if (_sizeMax > 1) {
-                    if (!current._ioCompleted) {
-                        //
-                        // The handler didn't call ioCompleted() so we take care of decreasing
-                        // the IO thread count now.
-                        //
-                        --_inUseIO;
-                    } else {
-                        //
-                        // If the handler called ioCompleted(), we re-enable the handler in
-                        // case it was disabled and we decrease the number of thread in use.
-                        //
-                        if (_serialize) {
-                            _selector.enable(current._handler, current.operation);
+                } catch (Exception ex) {
+                    if (_selectorRunning.get()) { // Only log if we're still supposed to be running
+                        String s = "exception in selector thread `" + _prefix + "':\n" + Ex.toString(ex);
+                        _instance.initializationData().logger.error(s);
+                        try {
+                            Thread.sleep(100); // Brief pause to avoid tight loop
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
                         }
-                        assert (_inUse > 0);
-                        --_inUse;
-                    }
-
-                    if (!current._leader && followerWait(current)) {
-                        return; // Wait timed-out.
-                    }
-                }
-
-                //
-                // Get the next ready handler.
-                //
-                current._handler = null;
-                while (_nextHandler.hasNext()) {
-                    EventHandlerOpPair n = _nextHandler.next();
-                    int op = n.op & ~n.handler._disabled & n.handler._registered;
-                    if (op != 0) {
-                        current._ioCompleted = false;
-                        current._handler = n.handler;
-                        current.operation = op;
-                        thread.setState(ThreadState.ThreadStateInUseForIO);
-                        break;
-                    }
-                }
-
-                if (current._handler == null) {
-                    //
-                    // If there are no more ready handlers and there are still threads busy
-                    // performing IO, we give up leadership and promote another follower (which will
-                    // perform the
-                    // select() only once all the IOs are completed). Otherwise, if there's no more
-                    // threads peforming IOs, it's time to do another select().
-                    //
-                    if (_inUseIO > 0) {
-                        promoteFollower(current);
-                    } else {
-                        _handlers.clear();
-                        _selector.startSelect();
-                        select = true;
-                        thread.setState(ThreadState.ThreadStateIdle);
-                    }
-                } else if (_sizeMax > 1) {
-                    //
-                    // Increment the IO thread count and if there's still threads available to
-                    // perform IO and more handlers ready, we promote a follower.
-                    //
-                    ++_inUseIO;
-                    if (_nextHandler.hasNext() && _inUseIO < _sizeIO) {
-                        promoteFollower(current);
                     }
                 }
             }
         }
     }
 
-    synchronized void ioCompleted(ThreadPoolCurrent current) {
+    // Queue handler as work item
+    private void queueHandler(EventHandler handler, int operation) {
+        _workQueue.offer(new HandlerWorkItem(handler, operation));
+    }
+
+    // Worker thread run method for work queue pattern
+    private void run(EventHandlerThread thread) {
+        ThreadPoolCurrent current = new ThreadPoolCurrent(_instance, this, thread);
+        
+        while (true) {
+            try {
+                ThreadPoolWorkItem workItem = _workQueue.take();
+                
+                if (_destroyed) {
+                    return;
+                }
+                
+                try {
+                    workItem.execute(current);
+                } catch (DestroyedException ex) {
+                    return;
+                } catch (Exception ex) {
+                    String s = "exception in `" + _prefix + "':\n" + Ex.toString(ex);
+                    _instance.initializationData().logger.error(s);
+                }
+                
+                current._handler = null;
+                current.stream.reset();
+                thread.setState(ThreadState.ThreadStateIdle);
+                
+            } catch (InterruptedException ex) {
+                return;
+            }
+        }
+    }
+
+    // ioCompleted for work queue pattern. There is nothing to do here
+    // really. Threads are all wiating on the blocking queue to consume
+    // work
+    void ioCompleted(ThreadPoolCurrent current) {
         current._ioCompleted =
             true; // Set the IO completed flag to specify that ioCompleted() has been called.
 
         current._thread.setState(ThreadState.ThreadStateInUseForUser);
-
-        if (_sizeMax > 1) {
-            --_inUseIO;
-
-            if (!_destroyed) {
-                if (_serialize) {
-                    _selector.disable(current._handler, current.operation);
-                }
-            }
-
-            if (current._leader) {
-                //
-                // If this thread is still the leader, it's time to promote a new leader.
-                //
-                promoteFollower(current);
-            } else if (_promote && (_nextHandler.hasNext() || _inUseIO == 0)) {
-                notify();
-            }
-
-            assert (_inUse >= 0);
-            ++_inUse;
-
-            if (_inUse == _sizeWarn) {
-                String s =
-                    "thread pool `"
-                        + _prefix
-                        + "' is running low on threads\n"
-                        + "Size="
-                        + _size
-                        + ", "
-                        + "SizeMax="
-                        + _sizeMax
-                        + ", "
-                        + "SizeWarn="
-                        + _sizeWarn;
-                _instance.initializationData().logger.warning(s);
-            }
-
-            if (!_destroyed) {
-                assert (_inUse <= _threads.size());
-                if (_inUse < _sizeMax && _inUse == _threads.size()) {
-                    if (_instance.traceLevels().threadPool >= 1) {
-                        String s = "growing " + _prefix + ": Size=" + (_threads.size() + 1);
-                        _instance
-                            .initializationData()
-                            .logger
-                            .trace(_instance.traceLevels().threadPoolCat, s);
-                    }
-
-                    try {
-                        EventHandlerThread thread =
-                            new EventHandlerThread(_threadPrefix + "-" + _threadIndex++);
-                        _threads.add(thread);
-                        if (_hasPriority) {
-                            thread.start(_priority);
-                        } else {
-                            thread.start(Thread.NORM_PRIORITY);
-                        }
-                    } catch (RuntimeException ex) {
-                        String s =
-                            "cannot create thread for `" + _prefix + "':\n" + Ex.toString(ex);
-                        _instance.initializationData().logger.error(s);
-                    }
-                }
-            }
-        }
     }
 
-    private synchronized void promoteFollower(ThreadPoolCurrent current) {
-        assert (!_promote && current._leader);
-        _promote = true;
-        if (_inUseIO < _sizeIO && (_nextHandler.hasNext() || _inUseIO == 0)) {
-            notify();
-        }
-        current._leader = false;
-    }
-
-    private synchronized boolean followerWait(ThreadPoolCurrent current) {
-        assert (!current._leader);
-
-        current._thread.setState(ThreadState.ThreadStateIdle);
-
-        //
-        // It's important to clear the handler before waiting to make sure that resources for the
-        // handler are released now if it's finished. We also clear the per-thread stream.
-        //
-        current._handler = null;
-        current.stream.reset();
-
-        //
-        // Wait to be promoted and for all the IO threads to be done.
-        //
-        while (!_promote || _inUseIO == _sizeIO || (!_nextHandler.hasNext() && _inUseIO > 0)) {
-            if (_threadIdleTime > 0) {
-                long before = Time.currentMonotonicTimeMillis();
-                boolean interrupted = false;
-                try {
-                    //
-                    // If the wait is interrupted then we'll let the thread die as if it timed out.
-                    //
-                    wait(_threadIdleTime * 1000);
-                } catch (InterruptedException e) {
-                    interrupted = true;
-                }
-                if (interrupted
-                    || Time.currentMonotonicTimeMillis() - before >= _threadIdleTime * 1000) {
-                    if (!_destroyed
-                        && (!_promote
-                        || _inUseIO == _sizeIO
-                        || (!_nextHandler.hasNext() && _inUseIO > 0))) {
-                        if (_instance.traceLevels().threadPool >= 1) {
-                            String s = "shrinking " + _prefix + ": Size=" + (_threads.size() - 1);
-                            _instance
-                                .initializationData()
-                                .logger
-                                .trace(_instance.traceLevels().threadPoolCat, s);
-                        }
-                        assert (_threads.size()
-                            > 1); // Can only be called by a waiting follower thread.
-                        _threads.remove(current._thread);
-                        _workQueue.queue(new JoinThreadWorkItem(current._thread));
-                        return true;
-                    }
-                }
-            } else {
-                try {
-                    wait();
-                } catch (InterruptedException e) {
-                    //
-                    // Eat the InterruptedException.
-                    //
-                }
-            }
-        }
-        current._leader = true; // The current thread has become the leader.
-        _promote = false;
-        return false;
-    }
 
     private final Instance _instance;
     private final BiConsumer<Runnable, Connection> _executor;
-    private final ThreadPoolWorkQueue _workQueue;
     private boolean _destroyed;
     private final String _prefix;
     private final String _threadPrefix;
     private final Selector _selector;
+
+    // Selector thread management
+    private final AtomicBoolean _selectorRunning;
+    private SelectorThread _selectorThread;
+    private final BlockingQueue<ThreadPoolWorkItem> _workQueue;
 
     final class EventHandlerThread implements Runnable {
         EventHandlerThread(String name) {
@@ -705,13 +602,7 @@ final class ThreadPool implements Executor {
     private final long _threadIdleTime;
     private final int _stackSize;
 
-    private final List<EventHandlerThread> _threads = new ArrayList<>();
+    private List<EventHandlerThread> _threads = new ArrayList<>();
     private int _threadIndex; // For assigning thread names.
     private int _inUse; // Number of threads that are currently in use.
-    private int _inUseIO; // Number of threads that are currently performing IO.
-
-    private final List<EventHandlerOpPair> _handlers = new ArrayList<>();
-    private Iterator<EventHandlerOpPair> _nextHandler;
-
-    private boolean _promote;
 }

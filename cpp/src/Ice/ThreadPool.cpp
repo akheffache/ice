@@ -42,6 +42,10 @@ IceInternal::ThreadPoolWorkQueue::destroy()
     // lock_guard lock(_mutex); Called with the thread pool locked
     assert(!_destroyed);
     _destroyed = true;
+    
+    // Wake up all waiting worker threads
+    _threadPool._conditionVariable.notify_all();
+    
 #if defined(ICE_USE_IOCP)
     _threadPool._selector.completed(this, SocketOperationRead);
 #else
@@ -54,6 +58,10 @@ IceInternal::ThreadPoolWorkQueue::queue(function<void(ThreadPoolCurrent&)> item)
 {
     // lock_guard lock(_mutex); Called with the thread pool locked
     _workItems.push_back(std::move(item));
+    
+    // Wake up a waiting worker thread
+    _threadPool._conditionVariable.notify_one();
+    
 #if defined(ICE_USE_IOCP)
     _threadPool._selector.completed(this, SocketOperationRead);
 #else
@@ -62,6 +70,35 @@ IceInternal::ThreadPoolWorkQueue::queue(function<void(ThreadPoolCurrent&)> item)
         _threadPool._selector.ready(this, SocketOperationRead, true);
     }
 #endif
+}
+
+// Blocking dequeue for work queue pattern
+std::function<void(ThreadPoolCurrent&)>
+IceInternal::ThreadPoolWorkQueue::dequeue()
+{
+    unique_lock<mutex> lock(_threadPool._mutex);
+    
+    while (_workItems.empty() && !_destroyed)
+    {
+        _threadPool._conditionVariable.wait(lock);
+    }
+    
+    if (_destroyed)
+    {
+        throw ThreadPoolDestroyedException();
+    }
+    
+    auto item = std::move(_workItems.front());
+    _workItems.pop_front();
+    
+#if !defined(ICE_USE_IOCP)
+    if (_workItems.empty() && !_destroyed)
+    {
+        _threadPool._selector.ready(this, SocketOperationRead, false);
+    }
+#endif
+    
+    return item;
 }
 
 #if defined(ICE_USE_IOCP)
@@ -150,10 +187,6 @@ IceInternal::ThreadPool::ThreadPool(const InstancePtr& instance, string prefix, 
       _selector(instance),
       _serialize(_instance->initializationData().properties->getPropertyAsInt(_prefix + ".Serialize") > 0),
       _serverIdleTime(timeout)
-#if !defined(ICE_USE_IOCP)
-      ,
-      _nextHandler(_handlers.end())
-#endif
 {
     // Check for unknown thread pool properties
     validatePropertiesWithPrefix(
@@ -242,6 +275,10 @@ IceInternal::ThreadPool::initialize()
 
 #ifdef ICE_USE_IOCP
     _selector.setup(_sizeIO);
+#else
+    // Start the dedicated selector thread for work queue pattern
+    _selectorRunning = true;
+    _selectorThread = std::thread(&ThreadPool::runSelector, this);
 #endif
 
     _workQueue = make_shared<ThreadPoolWorkQueue>(*this);
@@ -287,6 +324,15 @@ IceInternal::ThreadPool::destroy()
         return;
     }
     _destroyed = true;
+    
+#if !defined(ICE_USE_IOCP)
+    /*
+      Stop the selector thread
+      selector.wakeup() will be called when _workQueue->destroy() is called below
+    */
+    _selectorRunning = false;
+#endif
+    
     _workQueue->destroy();
 }
 
@@ -460,6 +506,14 @@ IceInternal::ThreadPool::joinWithAllThreads()
 {
     assert(_destroyed);
 
+#if !defined(ICE_USE_IOCP)
+    //  Join selector thread first
+    if (_selectorThread.joinable())
+    {
+        _selectorThread.join();
+    }
+#endif
+
     //
     // _threads is immutable after destroy() has been called,
     // therefore no synchronization is needed. (Synchronization
@@ -479,155 +533,138 @@ IceInternal::ThreadPool::prefix() const
     return _prefix;
 }
 
+// Dedicated selector thread function for work queue pattern
+#if !defined(ICE_USE_IOCP)
+void
+IceInternal::ThreadPool::runSelector()
+{
+    std::vector<std::pair<EventHandler*, SocketOperation>> handlers;
+    
+    while (_selectorRunning)
+    {
+        try
+        {
+            handlers.clear();
+            _selector.startSelect();
+            _selector.select(_serverIdleTime);
+            _selector.finishSelect(handlers);
+            
+            // Queue all ready handlers as work items
+            for (const auto& handlerPair : handlers)
+            {
+                if (!handlerPair.first)
+                    continue;
+                    
+                auto handler = handlerPair.first->shared_from_this();
+                SocketOperation op = handlerPair.second;
+                
+                // Queue this handler for processing by worker threads
+                queueHandler(handler, op);
+            }
+        }
+        catch (const SelectorTimeoutException&)
+        {
+            lock_guard lock(_mutex);
+            if (!_destroyed && _inUse == 0)
+            {
+                _workQueue->queue([instance = _instance](ThreadPoolCurrent& shutdownCurrent)
+                                  { shutdown(shutdownCurrent, instance); });
+            }
+        }
+        catch (const std::exception& ex)
+        {
+            if (_selectorRunning) // Only log if we're still supposed to be running
+            {
+                Error out(_instance->initializationData().logger);
+                out << "exception in selector thread '" << _prefix << "':\n" << ex;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+}
+
+void
+IceInternal::ThreadPool::queueHandler(const EventHandlerPtr& handler, SocketOperation op)
+{
+    _workQueue->queue([handler, op](ThreadPoolCurrent& current)
+    {
+        current.operation = op;
+        current._handler = handler;
+        
+        // Check if handler is still valid and interested in this operation
+        if (!(handler->_registered & op) || (handler->_disabled & op))
+        {
+            current.ioCompleted();
+            return;
+        }
+        
+        current._thread->setState(ThreadState::ThreadStateInUseForIO);
+        
+        try
+        {
+            handler->message(current);
+        }
+        catch (const std::exception& ex)
+        {
+            Error out(current._threadPool->_instance->initializationData().logger);
+            out << "exception in '" << current._threadPool->_prefix << "':\n"
+                << ex << "\nevent handler: " << handler->toString();
+        }
+        
+        if (!current._ioCompleted)
+        {
+            current.ioCompleted();
+        }
+    });
+}
+#endif
+
+// Worker thread run method for work queue pattern
 void
 IceInternal::ThreadPool::run(const EventHandlerThreadPtr& thread)
 {
 #if !defined(ICE_USE_IOCP)
     ThreadPoolCurrent current(shared_from_this(), thread);
-    bool select = false;
+    
     while (true)
     {
-        if (current._handler)
+        try
         {
+            // Block until work is available from the work queue
+            auto workItem = _workQueue->dequeue();
+            
+            if (_destroyed)
+            {
+                return;
+            }
+            
             try
             {
-                current._handler->message(current);
+                workItem(current);
             }
             catch (const ThreadPoolDestroyedException&)
             {
-                lock_guard lock(_mutex);
-                --_inUse;
-                thread->setState(ThreadState::ThreadStateIdle);
                 return;
             }
-            catch (const exception& ex)
+            catch (const std::exception& ex)
             {
                 Error out(_instance->initializationData().logger);
-                out << "exception in '" << _prefix << "':\n"
-                    << ex << "\nevent handler: " << current._handler->toString();
+                out << "exception in '" << _prefix << "':\n" << ex;
             }
             catch (...)
             {
                 Error out(_instance->initializationData().logger);
-                out << "exception in '" << _prefix << "':\nevent handler: " << current._handler->toString();
+                out << "unknown exception in '" << _prefix << "'";
             }
+            
+            // Reset for next work item
+            current._handler = nullptr;
+            thread->setState(ThreadState::ThreadStateIdle);
+            
         }
-        else if (select)
+        catch (const ThreadPoolDestroyedException&)
         {
-            try
-            {
-                _selector.select(_serverIdleTime);
-            }
-            catch (const SelectorTimeoutException&)
-            {
-                lock_guard lock(_mutex);
-                if (!_destroyed && _inUse == 0)
-                {
-                    _workQueue->queue([instance = _instance](ThreadPoolCurrent& shutdownCurrent)
-                                      { shutdown(shutdownCurrent, instance); });
-                }
-                continue;
-            }
-        }
-
-        {
-            unique_lock lock(_mutex);
-            if (!current._handler)
-            {
-                if (select)
-                {
-                    _selector.finishSelect(_handlers);
-                    _nextHandler = _handlers.begin();
-                    select = false;
-                }
-                else if (!current._leader && followerWait(current, lock))
-                {
-                    return; // Wait timed-out.
-                }
-            }
-            else if (_sizeMax > 1)
-            {
-                if (!current._ioCompleted)
-                {
-                    //
-                    // The handler didn't call ioCompleted() so we take care of decreasing
-                    // the IO thread count now.
-                    //
-                    --_inUseIO;
-                }
-                else
-                {
-                    //
-                    // If the handler called ioCompleted(), we re-enable the handler in
-                    // case it was disabled and we decrease the number of thread in use.
-                    //
-                    if (_serialize && current._handler.get() != _workQueue.get())
-                    {
-                        _selector.enable(current._handler.get(), current.operation);
-                    }
-                    assert(_inUse > 0);
-                    --_inUse;
-                }
-
-                if (!current._leader && followerWait(current, lock))
-                {
-                    return; // Wait timed-out.
-                }
-            }
-
-            //
-            // Get the next ready handler.
-            //
-            while (_nextHandler != _handlers.end() &&
-                   !(_nextHandler->second & ~_nextHandler->first->_disabled & _nextHandler->first->_registered))
-            {
-                ++_nextHandler;
-            }
-            if (_nextHandler != _handlers.end())
-            {
-                current._ioCompleted = false;
-                current._handler = _nextHandler->first->shared_from_this();
-                current.operation = _nextHandler->second;
-                ++_nextHandler;
-                thread->setState(ThreadState::ThreadStateInUseForIO);
-            }
-            else
-            {
-                current._handler = nullptr;
-            }
-
-            if (!current._handler)
-            {
-                //
-                // If there are no more ready handlers and there are still threads busy performing
-                // IO, we give up leadership and promote another follower (which will perform the
-                // select() only once all the IOs are completed). Otherwise, if there are no more
-                // threads performing IOs, it's time to do another select().
-                //
-                if (_inUseIO > 0)
-                {
-                    promoteFollower(current);
-                }
-                else
-                {
-                    _handlers.clear();
-                    _selector.startSelect();
-                    select = true;
-                    thread->setState(ThreadState::ThreadStateIdle);
-                }
-            }
-            else if (_sizeMax > 1)
-            {
-                //
-                // Increment the IO thread count and if there are still threads available
-                // to perform IO and more handlers ready, we promote a follower.
-                //
-                ++_inUseIO;
-                if (_nextHandler != _handlers.end() && _inUseIO < _sizeIO)
-                {
-                    promoteFollower(current);
-                }
-            }
+            return;
         }
     }
 #else
@@ -749,27 +786,8 @@ IceInternal::ThreadPool::ioCompleted(ThreadPoolCurrent& current)
     if (_sizeMax > 1)
     {
 #if !defined(ICE_USE_IOCP)
-        --_inUseIO;
-
-        if (!_destroyed)
-        {
-            if (_serialize && current._handler.get() != _workQueue.get())
-            {
-                _selector.disable(current._handler.get(), current.operation);
-            }
-        }
-
-        if (current._leader)
-        {
-            //
-            // If this thread is still the leader, it's time to promote a new leader.
-            //
-            promoteFollower(current);
-        }
-        else if (_promote && (_nextHandler != _handlers.end() || _inUseIO == 0))
-        {
-            _conditionVariable.notify_one();
-        }
+        // Just notify waiting threads that work might be available
+        _conditionVariable.notify_one();
 #endif
 
         assert(_inUse >= 0);
@@ -908,65 +926,6 @@ IceInternal::ThreadPool::finishMessage(ThreadPoolCurrent& current)
     {
         finish(current._handler, false);
     }
-}
-#else
-void
-IceInternal::ThreadPool::promoteFollower(ThreadPoolCurrent& current)
-{
-    assert(!_promote && current._leader);
-    _promote = true;
-    if (_inUseIO < _sizeIO && (_nextHandler != _handlers.end() || _inUseIO == 0))
-    {
-        _conditionVariable.notify_one();
-    }
-    current._leader = false;
-}
-
-bool
-IceInternal::ThreadPool::followerWait(ThreadPoolCurrent& current, unique_lock<mutex>& lock)
-{
-    assert(!current._leader);
-
-    current._thread->setState(ThreadState::ThreadStateIdle);
-
-    //
-    // It's important to clear the handler before waiting to make sure that
-    // resources for the handler are released now if it's finished.
-    //
-    current._handler = nullptr;
-
-    //
-    // Wait to be promoted and for all the IO threads to be done.
-    //
-    while (!_promote || _inUseIO == _sizeIO || (_nextHandler == _handlers.end() && _inUseIO > 0))
-    {
-        if (_threadIdleTime)
-        {
-            if (_conditionVariable.wait_for(lock, chrono::seconds(_threadIdleTime)) != cv_status::no_timeout)
-            {
-                if (!_destroyed &&
-                    (!_promote || _inUseIO == _sizeIO || (_nextHandler == _handlers.end() && _inUseIO > 0)))
-                {
-                    if (_instance->traceLevels()->threadPool >= 1)
-                    {
-                        Trace out(_instance->initializationData().logger, _instance->traceLevels()->threadPoolCat);
-                        out << "shrinking " << _prefix << ": Size=" << (_threads.size() - 1);
-                    }
-                    assert(_threads.size() > 1); // Can only be called by a waiting follower thread.
-                    _threads.erase(current._thread);
-                    _workQueue->queue([thread = current._thread](ThreadPoolCurrent&) { joinThread(thread); });
-                    return true;
-                }
-            }
-        }
-        else
-        {
-            _conditionVariable.wait(lock);
-        }
-    }
-    current._leader = true; // The current thread has become the leader.
-    _promote = false;
-    return false;
 }
 #endif
 
@@ -1112,4 +1071,5 @@ ThreadPoolCurrent::ThreadPoolCurrent(const ThreadPoolPtr& threadPool, ThreadPool
     : _threadPool(threadPool.get()),
       _thread(std::move(thread))
 {
+    // Nothing to do here. _leader = true is no longer needed for work queue pattern
 }

@@ -16,6 +16,8 @@
 #include <list>
 #include <set>
 #include <thread>
+#include <queue>
+#include <atomic>
 
 namespace IceInternal
 {
@@ -80,6 +82,7 @@ namespace IceInternal
         void initialize();
 
         void run(const EventHandlerThreadPtr&);
+        void runSelector(); // Dedicated selector thread function
 
         bool ioCompleted(ThreadPoolCurrent&);
 
@@ -87,8 +90,8 @@ namespace IceInternal
         bool startMessage(ThreadPoolCurrent&);
         void finishMessage(ThreadPoolCurrent&);
 #else
-        void promoteFollower(ThreadPoolCurrent&);
-        bool followerWait(ThreadPoolCurrent&, std::unique_lock<std::mutex>&);
+        // Queue handler for processing
+        void queueHandler(const EventHandlerPtr&, SocketOperation);
 #endif
 
         std::string nextThreadId();
@@ -106,6 +109,10 @@ namespace IceInternal
         Selector _selector;
         int _nextThreadId{0};
 
+        // Selector thread management
+        std::thread _selectorThread;
+        std::atomic<bool> _selectorRunning{false};
+
         friend class EventHandlerThread;
         friend class ThreadPoolCurrent;
         friend class ThreadPoolWorkQueue;
@@ -120,13 +127,7 @@ namespace IceInternal
 
         std::set<EventHandlerThreadPtr> _threads; // All threads, running or not.
         int _inUse{0};                            // Number of threads that are currently in use.
-#if !defined(ICE_USE_IOCP)
-        int _inUseIO{0}; // Number of threads that are currently performing IO.
-        std::vector<std::pair<EventHandler*, SocketOperation>> _handlers;
-        std::vector<std::pair<EventHandler*, SocketOperation>>::const_iterator _nextHandler;
-#endif
 
-        bool _promote{true};
         std::mutex _mutex;
         std::condition_variable _conditionVariable;
     };
@@ -156,9 +157,7 @@ namespace IceInternal
         ThreadPool::EventHandlerThreadPtr _thread;
         EventHandlerPtr _handler;
         bool _ioCompleted{false};
-#if !defined(ICE_USE_IOCP)
-        bool _leader{false};
-#else
+#if defined(ICE_USE_IOCP)
         DWORD _count;
         int _error;
 #endif
@@ -172,6 +171,9 @@ namespace IceInternal
 
         void destroy();
         void queue(std::function<void(ThreadPoolCurrent&)>);
+        
+        // Blocking dequeue for work queue pattern
+        std::function<void(ThreadPoolCurrent&)> dequeue();
 
 #if defined(ICE_USE_IOCP)
         bool startAsync(SocketOperation);
